@@ -11,6 +11,8 @@ import urllib
 import yaml
 
 from play.utils import *
+from play.application import PlayApplication
+
 
 NM = ['new-module', 'nm']
 LM = ['list-modules', 'lm']
@@ -53,7 +55,7 @@ def execute(**kargs):
     elif command in LM:
         list(app, args)
     elif command in BM:
-        build(app, args, env)
+        build_all(app, args, env)
     elif command in IM:
         install(app, args, env)
     elif command in AM:
@@ -247,7 +249,9 @@ def list(app, args):
     print "~ play install module (eg: play install scala)"
     print "~"
 
-def build(app, args, env):
+
+
+def build_all(app, args, env):
     ftb = env["basedir"]
     version = None
     fwkMatch = None
@@ -266,6 +270,43 @@ def build(app, args, env):
         print "~ "
         sys.exit(-1)
 
+    apps = [app]
+    base_path = get_basepath(app)
+    play_env = app.play_env
+    ignoreMissing = app.ignoreMissingModules
+
+    otherapps = [ argument for argument in args if '--' not in argument ]
+    for app in otherapps:
+        application_path = os.path.join(base_path, app)
+        play_app = PlayApplication(application_path, play_env, ignoreMissing)
+        apps.append(play_app)
+    
+    for app in apps:
+        appversion = version
+        appFwkMatch = fwkMatch
+        if appversion is None:
+            appversion = raw_input("~ What is the module version number? ")
+        if appFwkMatch is None:
+            appFwkMatch = raw_input("~ What are the playframework versions required? ")
+            
+        print '~ Building module %s' %  app.path
+        build(app, [], env, version, ftb, fwkMatch)
+
+# fetch the actual working dir
+def get_basepath(app):
+    # check if there is a build.xml in the current app dir. if there is,
+    # we're working with a real application/module
+    if os.path.exists(os.path.join(app.path, 'build.xml')):
+        return os.path.abspath(os.path.join(app.path, os.path.pardir))
+    else:
+        return app.path
+
+
+def build(app, args, env, version, ftb, fwkMatch):
+    # check if the appdir points to an actual module
+    if not os.path.exists(os.path.join(app.path, 'build.xml')):
+        return
+
     deps_file = os.path.join(app.path, 'conf', 'dependencies.yml')
     if os.path.exists(deps_file):
         f = open(deps_file)
@@ -279,11 +320,6 @@ def build(app, args, env):
                     fwkMatch = splitted[1]
         f.close
 
-    if version is None:
-        version = raw_input("~ What is the module version number? ")
-    if fwkMatch is None:
-        fwkMatch = raw_input("~ What are the playframework versions required? ")
-
     build_file = os.path.join(app.path, 'build.xml')
     if os.path.exists(build_file):
         print "~"
@@ -292,6 +328,7 @@ def build(app, args, env):
         os.system('ant -f %s -Dplay.path=%s' % (build_file, ftb) )
         print "~"
 
+    print "app.path", app.path
     mv = '%s-%s' % (os.path.basename(app.path), version)
     print("~ Packaging %s ... " % mv)
 
