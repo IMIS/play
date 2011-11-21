@@ -5,6 +5,7 @@ import play.Invoker;
 import play.Invoker.InvocationContext;
 import play.Logger;
 import play.Play;
+import play.data.binding.CachedBoundActionMethodArgs;
 import play.data.validation.Validation;
 import play.exceptions.PlayException;
 import play.exceptions.UnexpectedException;
@@ -159,6 +160,7 @@ public class ServletWrapper extends HttpServlet implements ServletContextListene
             Scope.Flash.current.remove();
             Scope.RenderArgs.current.remove();
             Scope.RouteArgs.current.remove();
+            CachedBoundActionMethodArgs.clear();
         }
     }
 
@@ -235,10 +237,7 @@ public class ServletWrapper extends HttpServlet implements ServletContextListene
 
         URI uri = new URI(httpServletRequest.getRequestURI());
         String method = httpServletRequest.getMethod().intern();
-        String path = uri.getRawPath();
-        if (path != null ) {
-            path = URLDecoder.decode(path, "utf-8");
-        }
+        String path = uri.getPath();
         String querystring = httpServletRequest.getQueryString() == null ? "" : httpServletRequest.getQueryString();
 
         if (Logger.isTraceEnabled()) {

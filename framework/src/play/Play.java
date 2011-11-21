@@ -250,7 +250,7 @@ public class Play {
         // Build basic java source path
         VirtualFile appRoot = VirtualFile.open(applicationPath);
         roots.add(appRoot);
-        javaPath = new ArrayList<VirtualFile>(2);
+        javaPath = Collections.synchronizedList(new ArrayList<VirtualFile>(2));
         javaPath.add(appRoot.child("app"));
         javaPath.add(appRoot.child("conf"));
 
@@ -362,7 +362,7 @@ public class Play {
                 fatalServerErrorOccurred();
             }
         }
-        // Ok, check for instance specifics configuration
+        // OK, check for instance specifics configuration
         Properties newConfiguration = new OrderSafeProperties();
         Pattern pattern = Pattern.compile("^%([a-zA-Z0-9_\\-]+)\\.(.*)$");
         for (Object key : propsFromFile.keySet()) {
@@ -396,6 +396,9 @@ public class Play {
                     r = Play.frameworkPath.getAbsolutePath();
                 } else {
                     r = System.getProperty(jp);
+                    if (r == null) {
+                        r = System.getenv(jp);
+                    }
                     if (r == null) {
                         Logger.warn("Cannot replace %s in configuration (%s=%s)", jp, key, value);
                         continue;
@@ -547,8 +550,8 @@ public class Play {
     public static synchronized void stop() {
         if (started) {
             Logger.trace("Stopping the play application");
-            started = false;
             pluginCollection.onApplicationStop();
+            started = false;
             Cache.stop();
             Router.lastLoading = 0L;
         }

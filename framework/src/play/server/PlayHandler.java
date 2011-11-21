@@ -31,6 +31,9 @@ import play.mvc.Http.Request;
 import play.mvc.Http.Response;
 import play.mvc.results.NotFound;
 import play.mvc.results.RenderStatic;
+import play.server.hybi10.Base64;
+import play.server.hybi10.Hybi10WebSocketFrameDecoder;
+import play.server.hybi10.Hybi10WebSocketFrameEncoder;
 import play.templates.JavaExtensions;
 import play.templates.TemplateLoader;
 import play.utils.HTTP;
@@ -41,8 +44,10 @@ import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
+import java.nio.charset.Charset;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.text.ParseException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -50,6 +55,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 import static org.jboss.netty.buffer.ChannelBuffers.wrappedBuffer;
 import static org.jboss.netty.handler.codec.http.HttpHeaders.Names.*;
+import static org.jboss.netty.handler.codec.http.HttpHeaders.Values.WEBSOCKET;
 
 public class PlayHandler extends SimpleChannelUpstreamHandler {
 
@@ -61,17 +67,28 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
     private final static String signature = "Play! Framework;" + Play.version + ";" + Play.mode.name().toLowerCase();
     private final static boolean exposePlayServer;
 
+    private static final String ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    private static final Charset ASCII = Charset.forName("ASCII");
+    private static final MessageDigest SHA_1;
+    static {
+        try {
+            SHA_1 = MessageDigest.getInstance("SHA1");
+        } catch (NoSuchAlgorithmException e) {
+            throw new InternalError("SHA-1 not supported on this platform");
+        }
+    } 
+    
     static {
         exposePlayServer = !"false".equals(Play.configuration.getProperty("http.exposePlayServer"));
     }
 
     @Override
-    public void messageReceived(final ChannelHandlerContext ctx, final MessageEvent e) throws Exception {
+    public void messageReceived(final ChannelHandlerContext ctx, final MessageEvent messageEvent) throws Exception {
         if (Logger.isTraceEnabled()) {
             Logger.trace("messageReceived: begin");
         }
 
-        final Object msg = e.getMessage();
+        final Object msg = messageEvent.getMessage();
 
         // Http request
         if (msg instanceof HttpRequest) {
@@ -79,14 +96,14 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
             final HttpRequest nettyRequest = (HttpRequest) msg;
 
             // Websocket upgrade
-            if (HttpHeaders.Values.UPGRADE.equalsIgnoreCase(nettyRequest.getHeader(CONNECTION)) && HttpHeaders.Values.WEBSOCKET.equalsIgnoreCase(nettyRequest.getHeader(HttpHeaders.Names.UPGRADE))) {
-                websocketHandshake(ctx, nettyRequest, e);
+            if (HttpHeaders.Values.WEBSOCKET.equalsIgnoreCase(nettyRequest.getHeader(HttpHeaders.Names.UPGRADE))) {
+                websocketHandshake(ctx, nettyRequest, messageEvent);
                 return;
             }
 
             // Plain old HttpRequest
             try {
-                final Request request = parseRequest(ctx, nettyRequest);
+                final Request request = parseRequest(ctx, nettyRequest, messageEvent);
 
                 final Response response = new Response();
                 Http.Response.current.set(response);
@@ -112,7 +129,7 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
                 } else {
 
                     // Deleguate to Play framework
-                    Invoker.invoke(new NettyInvocation(request, response, ctx, nettyRequest, e));
+                    Invoker.invoke(new NettyInvocation(request, response, ctx, nettyRequest, messageEvent));
 
                 }
 
@@ -482,8 +499,9 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
         }
     }
 
-    static String getRemoteIPAddress(ChannelHandlerContext ctx) {
-        String fullAddress = ((InetSocketAddress) ctx.getChannel().getRemoteAddress()).getAddress().getHostAddress();
+
+    static String getRemoteIPAddress(MessageEvent e) {
+        String fullAddress = ((InetSocketAddress) e.getRemoteAddress()).getAddress().getHostAddress();
         if (fullAddress.matches("/[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+[:][0-9]+")) {
             fullAddress = fullAddress.substring(1);
             fullAddress = fullAddress.substring(0, fullAddress.indexOf(":"));
@@ -493,7 +511,7 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
         return fullAddress;
     }
 
-    public Request parseRequest(ChannelHandlerContext ctx, HttpRequest nettyRequest) throws Exception {
+    public Request parseRequest(ChannelHandlerContext ctx, HttpRequest nettyRequest, MessageEvent messageEvent) throws Exception {
         if (Logger.isTraceEnabled()) {
             Logger.trace("parseRequest: begin");
             Logger.trace("parseRequest: URI = " + nettyRequest.getUri());
@@ -519,13 +537,13 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
 
         final int i = uri.indexOf("?");
         String querystring = "";
-        String path = URLDecoder.decode(uri, encoding);
+        String path = uri;
         if (i != -1) {
-            path = URLDecoder.decode(uri.substring(0, i), encoding);
+            path = uri.substring(0, i);
             querystring = uri.substring(i + 1);
         }
 
-        String remoteAddress = getRemoteIPAddress(ctx);
+        String remoteAddress = getRemoteIPAddress(messageEvent);
         String method = nettyRequest.getMethod().getName();
 
         if (nettyRequest.getHeader("X-HTTP-Method-Override") != null) {
@@ -554,7 +572,7 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
         String host = nettyRequest.getHeader(HOST);
         boolean isLoopback = false;
         try {
-            isLoopback = ((InetSocketAddress) ctx.getChannel().getRemoteAddress()).getAddress().isLoopbackAddress() && host.matches("^127\\.0\\.0\\.1:?[0-9]*$");
+            isLoopback = ((InetSocketAddress) messageEvent.getRemoteAddress()).getAddress().isLoopbackAddress() && host.matches("^127\\.0\\.0\\.1:?[0-9]*$");
         } catch (Exception e) {
             // ignore it
         }
@@ -666,8 +684,9 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
 
         String errorHtml = TemplateLoader.load("errors/404." + format).render(binding);
         try {
-            ChannelBuffer buf = ChannelBuffers.copiedBuffer(errorHtml.getBytes(Response.current().encoding));
-            setContentLength(nettyResponse, errorHtml.length());
+            byte[] bytes = errorHtml.getBytes(Response.current().encoding);
+            ChannelBuffer buf = ChannelBuffers.copiedBuffer(bytes);
+            setContentLength(nettyResponse, bytes.length);
             nettyResponse.setContent(buf);
             ChannelFuture writeFuture = ctx.getChannel().write(nettyResponse);
             writeFuture.addListener(ChannelFutureListener.CLOSE);
@@ -758,8 +777,9 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
             try {
                 String errorHtml = TemplateLoader.load("errors/500." + format).render(binding);
 
-                ChannelBuffer buf = ChannelBuffers.copiedBuffer(errorHtml.getBytes(encoding));
-                setContentLength(nettyResponse, errorHtml.length());
+                byte[] bytes = errorHtml.getBytes(encoding);
+                ChannelBuffer buf = ChannelBuffers.copiedBuffer(bytes);
+                setContentLength(nettyResponse, bytes.length);
                 nettyResponse.setContent(buf);
                 ChannelFuture writeFuture = ctx.getChannel().write(nettyResponse);
                 writeFuture.addListener(ChannelFutureListener.CLOSE);
@@ -769,8 +789,9 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
                 Logger.error(ex, "Error during the 500 response generation");
                 try {
                     final String errorHtml = "Internal Error (check logs)";
-                    ChannelBuffer buf = ChannelBuffers.copiedBuffer(errorHtml.getBytes(encoding));
-                    setContentLength(nettyResponse, errorHtml.length());
+                    byte[] bytes = errorHtml.getBytes(encoding);
+                    ChannelBuffer buf = ChannelBuffers.copiedBuffer(bytes);
+                    setContentLength(nettyResponse, bytes.length);
                     nettyResponse.setContent(buf);
                     ChannelFuture writeFuture = ctx.getChannel().write(nettyResponse);
                     writeFuture.addListener(ChannelFutureListener.CLOSE);
@@ -781,8 +802,9 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
         } catch (Throwable exxx) {
             try {
                 final String errorHtml = "Internal Error (check logs)";
-                ChannelBuffer buf = ChannelBuffers.copiedBuffer(errorHtml.getBytes(encoding));
-                setContentLength(nettyResponse, errorHtml.length());
+                byte[] bytes = errorHtml.getBytes(encoding);
+                ChannelBuffer buf = ChannelBuffers.copiedBuffer(bytes);
+                setContentLength(nettyResponse, bytes.length);
                 nettyResponse.setContent(buf);
                 ChannelFuture writeFuture = ctx.getChannel().write(nettyResponse);
                 writeFuture.addListener(ChannelFutureListener.CLOSE);
@@ -819,7 +841,7 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
             if ((file == null || !file.exists())) {
                 serve404(new NotFound("The file " + renderStatic.file + " does not exist"), ctx, request, nettyRequest);
             } else {
-                boolean raw = Play.pluginCollection.serveStatic(file, Request.current(), Response.current());
+                boolean raw = Play.pluginCollection.serveStatic(file, request, response);
                 if (raw) {
                     copyResponse(ctx, request, response, nettyRequest);
                 } else {
@@ -891,8 +913,9 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
             try {
                 HttpResponse errorResponse = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.INTERNAL_SERVER_ERROR);
                 final String errorHtml = "Internal Error (check logs)";
-                ChannelBuffer buf = ChannelBuffers.copiedBuffer(errorHtml.getBytes(response.encoding));
-                setContentLength(nettyResponse, errorHtml.length());
+                byte[] bytes = errorHtml.getBytes(response.encoding);
+                ChannelBuffer buf = ChannelBuffers.copiedBuffer(bytes);
+                setContentLength(nettyResponse, bytes.length);
                 errorResponse.setContent(buf);
                 ChannelFuture future = ctx.getChannel().write(errorResponse);
                 future.addListener(ChannelFutureListener.CLOSE);
@@ -1045,8 +1068,107 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
             inbound._received(new Http.WebSocketFrame(webSocketFrame.getTextData()));
         }
     }
+    
+    private String getWebSocketLocation(HttpRequest req) {
+        return "ws://" + req.getHeader(HttpHeaders.Names.HOST) + req.getUri();
+    }
 
-    private void websocketHandshake(final ChannelHandlerContext ctx, HttpRequest req, MessageEvent e) throws Exception {
+    protected void adjustPipelineToHixie(ChannelHandlerContext ctx) {
+        ChannelPipeline p = ctx.getChannel().getPipeline();
+        p.remove("aggregator");
+        p.replace("decoder", "wsdecoder", new WebSocketFrameDecoder());
+        p.replace("encoder", "wsencoder", new WebSocketFrameEncoder());
+    }
+
+    protected void adjustPipelineToHybi(ChannelHandlerContext ctx) {    	
+        ChannelPipeline p = ctx.getChannel().getPipeline();
+        p.remove("aggregator");
+        p.replace("decoder", "wsdecoder", new Hybi10WebSocketFrameDecoder());
+        p.replace("encoder", "wsencoder", new Hybi10WebSocketFrameEncoder());
+    }
+    
+    private boolean isHybi10WebSocketRequest(HttpRequest req) {
+        return req.containsHeader("Sec-WebSocket-Version");
+    }
+
+    private boolean isHixie76WebSocketRequest(HttpRequest req) {
+        return req.containsHeader(SEC_WEBSOCKET_KEY1) && req.containsHeader(SEC_WEBSOCKET_KEY2);
+    }
+
+    private void upgradeResponseHybi10(HttpRequest req, HttpResponse res) {
+        String version = req.getHeader("Sec-WebSocket-Version");
+        if(!"8".equals(version)) {
+            res.setStatus(HttpResponseStatus.UPGRADE_REQUIRED);
+            res.setHeader("Sec-WebSocket-Version", "8");
+           
+            return;
+        }
+
+        String key = req.getHeader("Sec-WebSocket-Key");
+        if(key == null) {
+            res.setStatus(HttpResponseStatus.BAD_REQUEST);
+            Logger.info("BAD REQUEST");
+
+            return;
+        }
+       
+        String accept = Base64.encode(sha1(key + ACCEPT_GUID));
+
+        res.setStatus(new HttpResponseStatus(101, "Switching Protocols"));
+        res.addHeader(UPGRADE, WEBSOCKET.toLowerCase());
+        res.addHeader(CONNECTION, UPGRADE);
+        res.addHeader("Sec-WebSocket-Accept", accept);
+        
+    }
+   
+
+    private byte[] sha1(String s) {
+        return SHA_1.digest(s.getBytes(ASCII));
+    }
+
+    private void upgradeResponseHixie76(HttpRequest req, HttpResponse res) {
+        res.setStatus(new HttpResponseStatus(101, "Web Socket Protocol Handshake"));
+        res.addHeader(UPGRADE, WEBSOCKET);
+        res.addHeader(CONNECTION, UPGRADE);
+        res.addHeader(SEC_WEBSOCKET_ORIGIN, req.getHeader(ORIGIN));
+        res.addHeader(SEC_WEBSOCKET_LOCATION, getWebSocketLocation(req));
+        String protocol = req.getHeader(SEC_WEBSOCKET_PROTOCOL);
+        if (protocol != null) {
+            res.addHeader(SEC_WEBSOCKET_PROTOCOL, protocol);
+        }
+
+        // Calculate the answer of the challenge.
+        String key1 = req.getHeader(SEC_WEBSOCKET_KEY1);
+        String key2 = req.getHeader(SEC_WEBSOCKET_KEY2);
+        int a = (int) (Long.parseLong(key1.replaceAll("[^0-9]", "")) / key1.replaceAll("[^ ]", "").length());
+        int b = (int) (Long.parseLong(key2.replaceAll("[^0-9]", "")) / key2.replaceAll("[^ ]", "").length());
+        long c = req.getContent().readLong();
+        ChannelBuffer input = ChannelBuffers.buffer(16);
+        input.writeInt(a);
+        input.writeInt(b);
+        input.writeLong(c);
+        try {
+            ChannelBuffer output = ChannelBuffers.wrappedBuffer(
+                    MessageDigest.getInstance("MD5").digest(input.array()));
+            res.setContent(output);
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private void upgradeResponseHixie75(HttpRequest req, HttpResponse res) {
+        res.setStatus(new HttpResponseStatus(101, "Web Socket Protocol Handshake"));
+        res.addHeader(UPGRADE, WEBSOCKET);
+        res.addHeader(CONNECTION, HttpHeaders.Values.UPGRADE);
+        res.addHeader(WEBSOCKET_ORIGIN, req.getHeader(ORIGIN));
+        res.addHeader(WEBSOCKET_LOCATION, getWebSocketLocation(req));
+        String protocol = req.getHeader(WEBSOCKET_PROTOCOL);
+        if (protocol != null) {
+            res.addHeader(WEBSOCKET_PROTOCOL, protocol);
+        }
+    }
+    
+    private void websocketHandshake(final ChannelHandlerContext ctx, HttpRequest req, MessageEvent messageEvent) throws Exception {
 
         // Create the WebSocket handshake response.
         HttpResponse res = new DefaultHttpResponse(HttpVersion.HTTP_1_1, new HttpResponseStatus(101, "Web Socket Protocol Handshake"));
@@ -1054,43 +1176,22 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
         res.addHeader(CONNECTION, HttpHeaders.Values.UPGRADE);
 
         // Fill in the headers and contents depending on handshake method.
-        if (req.containsHeader(SEC_WEBSOCKET_KEY1) && req.containsHeader(SEC_WEBSOCKET_KEY2)) {
-            // New handshake method with a challenge:
-            res.addHeader(SEC_WEBSOCKET_ORIGIN, req.getHeader(ORIGIN));
-            res.addHeader(SEC_WEBSOCKET_LOCATION, "ws://" + req.getHeader(HttpHeaders.Names.HOST) + req.getUri());
-            String protocol = req.getHeader(SEC_WEBSOCKET_PROTOCOL);
-            if (protocol != null) {
-                res.addHeader(SEC_WEBSOCKET_PROTOCOL, protocol);
-            }
-
-            // Calculate the answer of the challenge.
-            String key1 = req.getHeader(SEC_WEBSOCKET_KEY1);
-            String key2 = req.getHeader(SEC_WEBSOCKET_KEY2);
-            int a = (int) (Long.parseLong(key1.replaceAll("[^0-9]", "")) / key1.replaceAll("[^ ]", "").length());
-            int b = (int) (Long.parseLong(key2.replaceAll("[^0-9]", "")) / key2.replaceAll("[^ ]", "").length());
-            long c = req.getContent().readLong();
-            ChannelBuffer input = ChannelBuffers.buffer(16);
-            input.writeInt(a);
-            input.writeInt(b);
-            input.writeLong(c);
-            try {
-                ChannelBuffer output = ChannelBuffers.wrappedBuffer(MessageDigest.getInstance("MD5").digest(input.array()));
-                res.setContent(output);
-            } catch (NoSuchAlgorithmException ex) {
-                throw new UnexpectedException(ex);
-            }
+        if (isHybi10WebSocketRequest(req)) {
+            upgradeResponseHybi10(req, res);
+            ctx.getChannel().write(res);
+            adjustPipelineToHybi(ctx);
+        } else if (isHixie76WebSocketRequest(req)) {
+            upgradeResponseHixie76(req, res);
+            ctx.getChannel().write(res);
+            adjustPipelineToHixie(ctx);
         } else {
-            // Old handshake method with no challenge:
-            res.addHeader(WEBSOCKET_ORIGIN, req.getHeader(ORIGIN));
-            res.addHeader(WEBSOCKET_LOCATION, "ws://" + req.getHeader(HttpHeaders.Names.HOST) + req.getUri());
-            String protocol = req.getHeader(WEBSOCKET_PROTOCOL);
-            if (protocol != null) {
-                res.addHeader(WEBSOCKET_PROTOCOL, protocol);
-            }
+            upgradeResponseHixie75(req, res);
+            ctx.getChannel().write(res);
+            adjustPipelineToHixie(ctx);
         }
 
         // Keep the original request
-        Http.Request request = parseRequest(ctx, req);
+        Http.Request request = parseRequest(ctx, req, messageEvent);
 
         // Route the websocket request
         request.method = "WS";
@@ -1101,15 +1202,6 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
             return;
         }
 
-        // Upgrade the connection and send the handshake response.
-        ChannelPipeline p = ctx.getChannel().getPipeline();
-        p.remove("aggregator");
-        p.replace("decoder", "wsdecoder", new WebSocketFrameDecoder());
-
-        // Connect
-        ctx.getChannel().write(res);
-
-        p.replace("encoder", "wsencoder", new WebSocketFrameEncoder());
         req.setMethod(new HttpMethod("WEBSOCKET"));
 
         // Inbound
@@ -1160,6 +1252,7 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
                 if (!isOpen()) {
                     throw new IllegalStateException("The outbound channel is closed");
                 }
+
                 writeAndClose(ctx.getChannel().write(new DefaultWebSocketFrame(opcode, wrappedBuffer(data, offset, length))));
             }
 
@@ -1183,7 +1276,7 @@ public class PlayHandler extends SimpleChannelUpstreamHandler {
             }
         };
 
-        Invoker.invoke(new WebSocketInvocation(route, request, inbound, outbound, ctx, e));
+        Invoker.invoke(new WebSocketInvocation(route, request, inbound, outbound, ctx, messageEvent));
     }
 
     @Override

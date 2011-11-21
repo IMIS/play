@@ -89,6 +89,9 @@
 	open('/useAwaitViaOtherClass')
     assertTextPresent('failCount: 2')
 
+    open('@{WithContinuations.ControllerWhichUsesAwaitViaInheritance.useAwaitViaInheritance}')
+    assertTextPresent('true')
+
 	open('@{WithContinuations.useAwaitInWebSocketControllerWithContinuations()}')
     assertTextPresent('ok')
 
@@ -98,5 +101,10 @@
     open('@{WithContinuations.usingRenderArgsAndAwait()}')
     assertBodyText('true')
 
+    open('@{WithContinuations.usingRenderArgsAndAwaitWithCallBack("renderArg")}')
+    assertBodyText('renderArg')
+
+	open('@{WithContinuations.usingRenderArgsAndAwaitWithFutureAndCallback("renderArg")}')
+    assertBodyText('result/renderArg')
 
 #{/selenium}

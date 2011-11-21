@@ -8,6 +8,7 @@ import getopt
 import urllib2
 import webbrowser
 import time
+import signal
 
 from play.utils import *
 
@@ -119,14 +120,25 @@ def new(app, args, env, cmdloader=None):
     print "~ Have fun!"
     print "~"
 
+process = None
+
+def handle_sigterm(signum, frame):
+    global process
+    if 'process' in globals():
+        process.terminate()
+        sys.exit(0)
+
 def run(app, args):
+    global process
     app.check()
     
     print "~ Ctrl+C to stop"
     print "~ "
     java_cmd = app.java_cmd(args)
     try:
-        subprocess.call(java_cmd, env=os.environ)
+        process = subprocess.Popen (java_cmd, env=os.environ)
+        signal.signal(signal.SIGTERM, handle_sigterm)
+        process.wait()
     except OSError:
         print "Could not execute the java executable, please make sure the JAVA_HOME environment variable is set properly (the java executable should reside at JAVA_HOME/bin/java). "
         sys.exit(-1)
@@ -213,12 +225,16 @@ def autotest(app, args):
         line = soutint.readline().strip()
         if line:
             print line
-            if line.find('/@tests to run the tests') > -1:
+            if line.find('Listening for HTTP') > -1:
                 soutint.close()
                 break
 
     # Run FirePhoque
     print "~"
+
+    headless_browser = ''
+    if app.readConf('headlessBrowser'):
+        headless_browser = app.readConf('headlessBrowser')
 
     fpcp = [os.path.join(app.play_env["basedir"], 'modules/testrunner/lib/play-testrunner.jar')]
     fpcp_libs = os.path.join(app.play_env["basedir"], 'modules/testrunner/firephoque')
@@ -228,7 +244,7 @@ def autotest(app, args):
     cp_args = ':'.join(fpcp)
     if os.name == 'nt':
         cp_args = ';'.join(fpcp)    
-    java_cmd = [app.java_path(), '-classpath', cp_args, '-Dapplication.url=%s://localhost:%s' % (protocol, http_port), 'play.modules.testrunner.FirePhoque']
+    java_cmd = [app.java_path(), '-classpath', cp_args, '-Dapplication.url=%s://localhost:%s' % (protocol, http_port), '-DheadlessBrowser=%s' % (headless_browser), 'play.modules.testrunner.FirePhoque']
     try:
         subprocess.call(java_cmd, env=os.environ)
     except OSError:
@@ -237,12 +253,6 @@ def autotest(app, args):
 
     print "~"
     time.sleep(1)
-    if os.path.exists(os.path.join(app.path, 'test-result/result.passed')):
-        print "~ All tests passed"
-        print "~"
-    if os.path.exists(os.path.join(app.path, 'test-result/result.failed')):
-        print "~ Some tests have failed. See file://%s for results" % test_result
-        print "~"
     
     # Kill if exists
     http_port = app.readConf('http.port')
@@ -252,6 +262,15 @@ def autotest(app, args):
         opener.open('%s://localhost:%s/@kill' % (protocol, http_port))
     except Exception, e:
         pass
+ 
+    if os.path.exists(os.path.join(app.path, 'test-result/result.passed')):
+        print "~ All tests passed"
+        print "~"
+        testspassed = True
+    if os.path.exists(os.path.join(app.path, 'test-result/result.failed')):
+        print "~ Some tests have failed. See file://%s for results" % test_result
+        print "~"
+        sys.exit(1)
 
 def id(play_env):
     if not play_env["id"]:
