@@ -322,7 +322,7 @@ public class DependenciesManager {
         ResolveEngine resolveEngine = ivy.getResolveEngine();
         ResolveOptions resolveOptions = new ResolveOptions();
         resolveOptions.setConfs(new String[]{"default"});
-        resolveOptions.setArtifactFilter(FilterHelper.getArtifactTypeFilter(new String[]{"jar", "bundle"}));
+        resolveOptions.setArtifactFilter(FilterHelper.NO_FILTER);
 
         return resolveEngine.resolve(ivyModule.toURI().toURL(), resolveOptions);
     }
